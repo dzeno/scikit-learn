@@ -6,17 +6,20 @@ from __future__ import division
 
 import warnings
 import numpy as np
+import random
 from scipy import sparse
 from math import sqrt
-
+from math import ceil
+from repoze.lru import lru_cache
+from ..preprocessing import normalize
 from ..metrics.pairwise import euclidean_distances
 from ..base import TransformerMixin, ClusterMixin, BaseEstimator
 from ..externals.six.moves import xrange
 from ..utils import check_array
 from ..utils.extmath import row_norms, safe_sparse_dot
-from ..utils.validation import check_is_fitted
-from ..exceptions import NotFittedError
+from ..utils.validation import NotFittedError, check_is_fitted
 from .hierarchical import AgglomerativeClustering
+from .k_means_ import KMeans, MiniBatchKMeans
 
 
 def _iterate_sparse_X(X):
@@ -134,6 +137,7 @@ class _CFNode(object):
         view of ``init_sq_norm_``.
 
     """
+
     def __init__(self, threshold, branching_factor, is_leaf, n_features):
         self.threshold = threshold
         self.branching_factor = branching_factor
@@ -275,6 +279,7 @@ class _CFSubcluster(object):
         Squared norm of the subcluster. Used to prevent recomputing when
         pairwise minimum distances are computed.
     """
+
     def __init__(self, linear_sum=None):
         if linear_sum is None:
             self.n_samples_ = 0
@@ -328,8 +333,6 @@ class Birch(BaseEstimator, TransformerMixin, ClusterMixin):
     Tree. It is then clubbed together with the subcluster that has the
     centroid closest to the new sample. This is done recursively till it
     ends up at the subcluster of the leaf of the tree has the closest centroid.
-
-    Read more in the :ref:`User Guide <birch>`.
 
     Parameters
     ----------
@@ -491,7 +494,7 @@ class Birch(BaseEstimator, TransformerMixin, ClusterMixin):
             leaf_ptr = leaf_ptr.next_leaf_
         return leaves
 
-    def partial_fit(self, X=None, y=None):
+    def partial_fit(self, X=None, y=None, window=None):
         """
         Online learning. Prevents rebuilding of CFTree from scratch.
 
@@ -501,6 +504,7 @@ class Birch(BaseEstimator, TransformerMixin, ClusterMixin):
             Input data. If X is not provided, only the global clustering
             step is done.
         """
+        self.window = window
         self.partial_fit_, self.fit_ = True, False
         if X is None:
             # Perform just the final global clustering step.
@@ -546,7 +550,21 @@ class Birch(BaseEstimator, TransformerMixin, ClusterMixin):
         reduced_distance = safe_sparse_dot(X, self.subcluster_centers_.T)
         reduced_distance *= -2
         reduced_distance += self._subcluster_norms
-        return self.subcluster_labels_[np.argmin(reduced_distance, axis=1)]
+        my_labels = self.subcluster_labels_[
+            np.argmin(reduced_distance, axis=1)]
+        indexes = set(my_labels)
+
+        d = {}
+        for k, v in zip(my_labels, X):
+            d[k] = d.get(k, ()) + (v.tolist(),)
+
+        self.subcluster_points = []
+
+        for index in indexes:
+            self.subcluster_points.extend(random.sample(
+                d.get(index), len(d.get(index)) * 10 // 100))
+
+        return my_labels
 
     def transform(self, X, y=None):
         """
@@ -567,6 +585,115 @@ class Birch(BaseEstimator, TransformerMixin, ClusterMixin):
         """
         check_is_fitted(self, 'subcluster_centers_')
         return euclidean_distances(X, self.subcluster_centers_)
+
+# Pham algorithm start
+
+    @lru_cache(maxsize=500)
+    def _a(self, k, Nd):
+        if k == 2:
+            return 1 - 3 / (4 * Nd)
+        else:
+            return self._a(k - 1, Nd) + (1 - self._a(k - 1, Nd)) / 6
+
+    def _fK(self, clusterer, thisk, Skm1=0):
+        Nd = self.Nd
+        clusterer.n_clusters = thisk
+
+        print "Current k-iteration: " + str(thisk)
+
+        points = np.concatenate(
+            (self.subcluster_centers_, self.subcluster_points), axis=0)
+
+        print "We use this many points for Pham: " + str(len(points))
+        points_scaled = preprocessing.scale(points)
+        # points_scaled = StandardScaler().fit_transform(points)
+        self.subcluster_labels_ = clusterer.fit_predict(points_scaled)
+        Sk = clusterer.inertia_
+
+        if thisk == 1:
+            fs = 1
+        elif Skm1 == 0:
+            fs = 1
+        else:
+            fs = Sk / (self._a(thisk, Nd) * Skm1)
+        return fs, Sk
+
+    def _run_fk(self, clusterer, maxk):
+        ks = range(1, maxk)
+        fs = np.zeros(len(ks))
+        fs[0], Sk = self._fK(clusterer, 1)
+
+        for k in ks[1:]:
+            fs[k - 1], Sk = self._fK(clusterer, k, Skm1=Sk)
+
+        self.fs = fs
+        self.ks = ks
+
+# Pham ends --------------------------------------------------------------
+
+# Gap statistics algorithm start
+
+    def _run_gap(self, clusterer, maxk):
+        ks = range(1, maxk)
+        Wks, Wkbs, sks = np.zeros(
+            len(ks) + 1), np.zeros(len(ks) + 1), np.zeros(len(ks) + 1)
+        Wks[0], Wkbs[0], sks[0] = self._gap(clusterer, 1)
+
+        for k in ks[1:]:
+            Wks[k - 1], Wkbs[k - 1], sks[k - 1] = self._gap(clusterer, k)
+
+        G = []
+        for i in range(len(ks)):
+            G.append((Wkbs - Wks)[i] - ((Wkbs - Wks)[i + 1] - sks[i + 1]))
+
+        self.G = np.array(G)
+        self.ks = ks
+
+    def _bounding_box(self):
+        test = preprocessing.normalize(self.subcluster_points)
+        xmin, xmax = min(test, key=lambda a: a[0])[
+            0], max(test, key=lambda a: a[0])[0]
+        ymin, ymax = min(test, key=lambda a: a[1])[
+            1], max(test, key=lambda a: a[1])[1]
+        return (xmin, xmax), (ymin, ymax)
+
+    def _gap(self, clusterer, thisk):
+        (xmin, xmax), (ymin, ymax) = self._bounding_box()
+
+        print "I at thisk: " + str(thisk)
+        clusterer.n_clusters = thisk
+        # Print cluster centers to use in R
+        # np.set_printoptions(threshold='nan')
+        # print self.subcluster_centers_
+
+        points = np.concatenate(
+            (self.subcluster_centers_, self.subcluster_points), axis=0)
+
+        # Normalize data: Should be passed as param
+        # points_scaled = preprocessing.scale(points)
+        points_scaled = preprocessing.normalize(points)
+        # points_scaled = StandardScaler().fit_transform(points)
+        print "Number of points for Gap:" + str(len(points))
+        self.subcluster_labels_ = clusterer.fit_predict(points_scaled)
+        Wk = np.log(clusterer.inertia_)
+        # Create B reference datasets
+        B = 500
+        BWkbs = np.zeros(B)
+        for i in range(B):
+            Xb = []
+            for n in range(len(points)):
+                Xb.append([random.uniform(xmin, xmax),
+                           random.uniform(ymin, ymax)])
+            Xb = np.array(Xb)
+            clusterer.n_clusters = thisk
+            clusterer.fit(Xb)
+            BWkbs[i] = np.log(clusterer.inertia_)
+
+        Wkb = sum(BWkbs) / B
+        sk = np.sqrt(sum((BWkbs - Wkb)**2) / float(B)) * np.sqrt(1 + 1 / B)
+        return Wk, Wkb, sk
+
+# Gap statistics ends ----------------------------------------------------
 
     def _global_clustering(self, X=None):
         """
@@ -604,8 +731,34 @@ class Birch(BaseEstimator, TransformerMixin, ClusterMixin):
             # The global clustering step that clusters the subclusters of
             # the leaves. It assumes the centroids of the subclusters as
             # samples and finds the final centroids.
-            self.subcluster_labels_ = clusterer.fit_predict(
-                self.subcluster_centers_)
+            # This is K-means + k-estimation in action
+            # print "Window: " + str(self.window)
+            # if self.window == 100000:
+
+            x = []
+
+            for leaf in self._get_leaves():
+                for sc in leaf.subclusters_:
+                    x.append(sc.n_samples_)
+
+            # print "leaves: " + str(x)
+            avg = sum(x) / len(x)
+            # print "Avg elements in leaves: " + str(avg)
+
+            for item in x:
+                if item < avg:
+                    x.remove(item)
+
+            self.subcluster_labels_ = np.arange(len(centroids))
+            self.labels_ = self.predict(X)
+            # print self.subcluster_centers_[0]
+            # print type(self.subcluster_centers_)
+            self.Nd = len(self.subcluster_centers_[0])
+            print "Actual number of clusters: " + str(np.unique(self.labels_).size)
+            # print "Perform on this many k's: " + str(len(x))
+            # Perform Gap or FK
+            # self._run_fk(clusterer, 59)
+            self._run_gap(clusterer, 20)
 
         if compute_labels:
             self.labels_ = self.predict(X)
